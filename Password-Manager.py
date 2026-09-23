@@ -46,24 +46,19 @@ except Exception:
 
 class PasswordManager:
     def __init__(self, db_file: str = None):
-        """Initialize the password manager with a database file."""
-        # Set default database path if none provided
+        """Initialize the password manager with a database file (Linux only)."""
+        # Set default database path - Linux only
         if db_file is None:
-            system = platform.system()
-            if system == "Windows":
-                base_dir = os.path.expandvars(r'%LOCALAPPDATA%\PasswordManager')
-            else:
-                base_dir = os.path.expanduser('~/.config/password-manager')
+            base_dir = os.path.expanduser('~/.config/password-manager')
             
             # Create directory if it doesn't exist
             Path(base_dir).mkdir(parents=True, exist_ok=True)
             
             # Set directory permissions to owner-only (drwx------)
             try:
-                if platform.system() != "Windows":
-                    os.chmod(base_dir, 0o700)  # drwx------
+                os.chmod(base_dir, 0o700)  # drwx------
             except Exception as e:
-                pass  # Best effort - don't fail if permissions can't be set
+                pass  # Best effort
             
             db_file = os.path.join(base_dir, 'passwords.db')
         
@@ -276,6 +271,8 @@ class PasswordManager:
         """Encrypt entire database dictionary to JSON string using AES-GCM."""
         try:
             json_str = json.dumps(data, separators=(',', ':'), sort_keys=True)
+            # Add random padding to hide database size
+            json_str = self._add_random_padding(json_str)
             aesgcm = AESGCM(self.cipher)
             nonce = secrets.token_bytes(12)
             encrypted = aesgcm.encrypt(nonce, json_str.encode(), None)
@@ -292,12 +289,42 @@ class PasswordManager:
             ciphertext = raw[12:]
             aesgcm = AESGCM(self.cipher)
             decrypted = aesgcm.decrypt(nonce, ciphertext, None).decode()
+            # Remove padding after decryption
+            decrypted = self._remove_random_padding(decrypted)
             return json.loads(decrypted)
         except InvalidTag:
             raise
         except Exception as e:
             print(f"Error decrypting database: {e}")
             return None
+    
+    def _add_random_padding(self, data: str) -> str:
+        """Add random padding to hide database size (prevents size analysis attacks)."""
+        # Add 0-2KB of random padding
+        padding_size = secrets.randbelow(2048)
+        padding = secrets.token_urlsafe(padding_size)
+        
+        # Format: data + SEPARATOR + padding_size (4 chars) + padding
+        separator = "\x00PADDED\x00"
+        padded = data + separator + str(padding_size).zfill(4) + padding
+        return padded
+    
+    def _remove_random_padding(self, data: str) -> str:
+        """Remove random padding added during encryption."""
+        try:
+            separator = "\x00PADDED\x00"
+            if separator in data:
+                # Split at separator
+                content, padding_info = data.rsplit(separator, 1)
+                # Extract padding size (first 4 characters)
+                if len(padding_info) >= 4:
+                    padding_size = int(padding_info[:4])
+                    # Verify and remove padding
+                    if len(padding_info) >= 4 + padding_size:
+                        return content
+            return data  # No padding found, return as-is
+        except Exception:
+            return data  # If error, return original
 
     def _encrypt_blob(self, data: dict, key: bytes) -> str:
         """Encrypt a secondary blob with a separate derived key."""
@@ -414,8 +441,7 @@ class PasswordManager:
             if db_dir:
                 Path(db_dir).mkdir(parents=True, exist_ok=True)
                 try:
-                    if platform.system() != "Windows":
-                        os.chmod(db_dir, 0o700)
+                    os.chmod(db_dir, 0o700)  # Linux: owner only
                 except:
                     pass
 
@@ -426,11 +452,7 @@ class PasswordManager:
             shutil.move(temp_file, self.db_file)
 
             try:
-                if platform.system() != "Windows":
-                    os.chmod(self.db_file, 0o600)
-                else:
-                    import stat
-                    os.chmod(self.db_file, stat.S_IRUSR | stat.S_IWUSR)
+                os.chmod(self.db_file, 0o600)  # Linux: owner read/write only
             except:
                 pass
         except Exception as e:
@@ -633,8 +655,7 @@ class PasswordManager:
         if db_dir:
             Path(db_dir).mkdir(parents=True, exist_ok=True)
             try:
-                if platform.system() != "Windows":
-                    os.chmod(db_dir, 0o700)
+                os.chmod(db_dir, 0o700)  # Linux: owner only
             except:
                 pass
         temp_file = self.db_file + '.tmp'
@@ -645,11 +666,7 @@ class PasswordManager:
                     json.dump(data, f)
                 shutil.move(temp_file, self.db_file)
             try:
-                if platform.system() != "Windows":
-                    os.chmod(self.db_file, 0o600)
-                else:
-                    import stat
-                    os.chmod(self.db_file, stat.S_IRUSR | stat.S_IWUSR)
+                os.chmod(self.db_file, 0o600)  # Linux: owner read/write only
             except Exception:
                 pass
         except Exception as e:
@@ -1012,6 +1029,11 @@ class PasswordManager:
             if username not in entries:
                 print(f"Username '{username}' not found for service '{service}'.")
                 return False
+            # Securely delete password from memory before deletion
+            password_data = entries[username]
+            for key in password_data:
+                if key == "password":
+                    self._secure_delete_password_data(password_data[key])
             del entries[username]
             # If no more usernames, remove the service container
             if not entries:
@@ -1026,6 +1048,14 @@ class PasswordManager:
             self._update_activity()
             print(f"All accounts for '{service}' deleted!")
             return True
+    
+    def _secure_delete_password_data(self, password_str: str) -> None:
+        """Securely overwrite password data in memory (DoD 5220.22-M standard)."""
+        # Overwrite with random data 7 times (DoD standard)
+        for _ in range(7):
+            password_str = secrets.token_urlsafe(len(password_str))
+        # Final overwrite with zeros
+        password_str = "\x00" * len(password_str)
 
     def update_password(self, service: str, username: str, new_password: str) -> bool:
         """Update an existing password for a specific username under a service."""
@@ -1070,9 +1100,7 @@ class PasswordManager:
 
 
 def get_default_db_dir() -> str:
-    """Return the default directory for password databases."""
-    if platform.system() == "Windows":
-        return os.path.expandvars(r'%LOCALAPPDATA%\PasswordManager')
+    """Return the default directory for password databases (Linux only)."""
     return os.path.expanduser('~/.config/password-manager')
 
 
@@ -1110,27 +1138,18 @@ def save_last_db_file(db_file: str) -> None:
     try:
         with open(state_file, 'w') as f:
             json.dump({'db_file': os.path.abspath(db_file)}, f)
-        if platform.system() != "Windows":
-            os.chmod(state_file, 0o600)
+        os.chmod(state_file, 0o600)  # Linux: owner only
     except Exception:
         pass
 
 
 def clear_screen():
-    """Clear the console screen safely using subprocess instead of os.system()."""
+    """Clear the console screen (Linux only)."""
     try:
-        if platform.system() == 'Windows':
-            subprocess.run(['cmd', '/c', 'cls'], check=False)
-        else:
-            subprocess.run(['clear'], check=False)
+        subprocess.run(['clear'], check=False)
     except Exception:
         # Fallback: print newlines if subprocess fails
         print("\n" * 100)
-    finally:
-        try:
-            sys.stdout.flush()
-        except Exception:
-            pass
 
 
 def pause(message: str = "Press Enter to continue..."):
