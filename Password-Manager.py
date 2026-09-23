@@ -501,11 +501,25 @@ class PasswordManager:
 
             salt_b64 = file_data.get("salt", "")
             encrypted_data = file_data.get("encrypted_data", "")
+            stored_hmac = file_data.get("hmac_signature", "")
+            
             if not salt_b64 or not encrypted_data:
                 print("Error: Invalid database format")
                 return False
-
-            self.metadata = {k: v for k, v in file_data.items() if k not in {"salt", "encrypted_data", "version"}}
+            
+            # Verify HMAC integrity (defense-in-depth against tampering)
+            if stored_hmac:
+                if not self._verify_hmac(encrypted_data, stored_hmac):
+                    print("🚨 ERROR: Database integrity verification FAILED!")
+                    print("🚨 This means the database file may have been tampered with.")
+                    print("🚨 Your data is encrypted and safe, but the HMAC signature doesn't match.")
+                    print("🚨 Possible causes:")
+                    print("   - File was modified (corrupted or attacked)")
+                    print("   - Wrong master password (different encryption key)")
+                    print("   - Database file is from an older version")
+                    return False
+            
+            self.metadata = {k: v for k, v in file_data.items() if k not in {"salt", "encrypted_data", "version", "hmac_signature"}}
             self.failed_attempts = self.metadata.get("failed_attempts", 0)
             self.lockout_time = self.metadata.get("lockout_time")
             self.metadata.setdefault("answer_attempts", 0)
@@ -650,7 +664,7 @@ class PasswordManager:
             return False
 
     def _save_database_raw(self, data: dict) -> None:
-        """Save raw database file with just salt and encrypted_data (internal use only)."""
+        """Save raw database file with HMAC integrity verification."""
         db_dir = os.path.dirname(self.db_file)
         if db_dir:
             Path(db_dir).mkdir(parents=True, exist_ok=True)
@@ -658,6 +672,12 @@ class PasswordManager:
                 os.chmod(db_dir, 0o700)  # Linux: owner only
             except:
                 pass
+        
+        # Compute HMAC of encrypted_data for integrity verification
+        encrypted_data_str = data.get("encrypted_data", "")
+        hmac_value = self._compute_hmac(encrypted_data_str)
+        data["hmac"] = hmac_value  # Store HMAC with database
+        
         temp_file = self.db_file + '.tmp'
         lock_path = self.db_file + '.lock'
         try:
@@ -713,6 +733,11 @@ class PasswordManager:
             metadata["salt"] = salt_b64
             file_data = metadata.copy()
             file_data["encrypted_data"] = encrypted_data
+            
+            # Add HMAC integrity signature to detect tampering
+            hmac_sig = self._compute_hmac(encrypted_data)
+            file_data["hmac_signature"] = hmac_sig
+            
             self._save_database_raw(file_data)
         else:
             file_data = metadata.copy()
@@ -1283,7 +1308,29 @@ def main():
         print("13. Exit")
         print("=" * 50)
         
-        choice = input("\nEnter your choice (1-13): ").strip()
+        # Secure menu input (doesn't echo keystrokes to terminal)
+        choice = getpass.getpass(prompt="\nEnter your choice (1-13 or full option name): ").strip().lower()
+        
+        # Map text input to numbers
+        choice_map = {
+            "add password": "1",
+            "get password": "2", "retrieve": "2",
+            "search": "3", "search services": "3",
+            "list": "4", "list services": "4",
+            "update": "5", "update password": "5",
+            "delete": "6", "delete password": "6",
+            "add recovery": "7", "add phrase": "7",
+            "get recovery": "8", "get phrase": "8", "retrieve phrase": "8",
+            "list recovery": "9", "list phrases": "9",
+            "update recovery": "10", "update phrase": "10",
+            "delete recovery": "11", "delete phrase": "11",
+            "generate": "12", "generate password": "12",
+            "exit": "13", "quit": "13", "logout": "13"
+        }
+        
+        # Handle text input
+        if choice in choice_map:
+            choice = choice_map[choice]
         
         if choice == "1":
             print()
